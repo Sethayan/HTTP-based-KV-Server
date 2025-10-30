@@ -1,0 +1,36 @@
+# Ignore compiled object files
+*.o
+
+# Ignore binary executables
+/bin/
+/bin/*
+server
+loadgen
+
+# Ignore build folders (if you use cmake or others)
+build/
+CMakeFiles/
+CMakeCache.txt
+Makefile.in
+cmake_install.cmake
+
+# Ignore temporary or log files
+*.log
+*.tmp
+*.out
+
+# Ignore local database files (just in case)
+*.db
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore experiment data and plots (optional)
+data/*.csv
+plots/*.png
+plots/*.jpg
+
+# Ignore backup files created by editors
+*~
+*.swp
