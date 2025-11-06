@@ -151,15 +151,32 @@ void client_thread(int id, const Config &cfg) {
 
         long http_code = 0;
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+        // cout << http_code << endl;
 
         long long latency_us = duration_cast<microseconds>(t1 - t0).count();
 
-        if (cres == CURLE_OK && http_code >= 200 && http_code < 300) {
-            successful_requests.fetch_add(1, memory_order_relaxed);
-            total_latency_us.fetch_add(latency_us, memory_order_relaxed);
-        } else {
-            failed_requests.fetch_add(1, memory_order_relaxed);
+        bool ok = (cres == CURLE_OK);
+        if (ok) {
+          if (http_code >= 200 && http_code < 300) {
+             ok = true;
+          } else if ((cfg.workload == Workload::GET_ALL || cfg.workload == Workload::GET_POPULAR) && http_code == 404) {
+          // Not found is acceptable for read workloads
+          ok = true;
+          } else if (cfg.workload == Workload::MIXED && http_code == 404) {
+         // Also fine in mixed workload, since some deletes/read may hit missing keys
+          ok = true;
+          } else {
+          ok = false;
         }
+    }
+
+    if (ok) {
+      successful_requests.fetch_add(1, memory_order_relaxed);
+      total_latency_us.fetch_add(latency_us, memory_order_relaxed);
+    } else {
+       failed_requests.fetch_add(1, memory_order_relaxed);
+    }
+
 
         // reset POST/CUSTOM flags so next iteration is clean
         curl_easy_setopt(curl, CURLOPT_POST, 0L);
