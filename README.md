@@ -33,7 +33,7 @@ Follow these steps to set up and run the project locally:
 1. Open another terminal 
 2. HTTP Request for create:
     ```bash
-    curl -X POST -d "key=mykey&value=myvalue" http://127.0.0.1:8080/create
+    curl -X POST -d "key=user1&value=myvalue" http://127.0.0.1:8080/create
 3. HTTP Request for read
     ```bash
    curl -X GET "http://127.0.0.1:8080/read?key=user1"
