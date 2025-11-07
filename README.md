@@ -26,20 +26,20 @@ Follow these steps to set up and run the project locally:
 **Run The Server**
 1. Navigate to Server directory
 2. Run the MakeFile
-  ```bash
-  make run
+   ```bash
+   make run
    
 **Run The Client**
 1. Open another terminal 
 2. HTTP Request for create:
-  ```bash
-  curl -X POST -d "key=mykey&value=myvalue" http://127.0.0.1:8080/create
+    ```bash
+    curl -X POST -d "key=mykey&value=myvalue" http://127.0.0.1:8080/create
 3. HTTP Request for read
-  ```bash
-  curl -X GET "http://127.0.0.1:8080/read?key=user1"
+    ```bash
+   curl -X GET "http://127.0.0.1:8080/read?key=user1"
 4. HTTP Request for delete
-  ```bash
-  curl -X DELETE "http://127.0.0.1:8080/delete?key=user1"
+   ```bash
+   curl -X DELETE "http://127.0.0.1:8080/delete?key=user1"
   
 
 

@@ -52,7 +52,7 @@ string db_read(PGconn* conn, const string& key) {
 
     string value = PQgetvalue(res, 0, 0);
     PQclear(res);
-    printf("Value return from Database\n");
+    //printf("Value return from Database\n");
     return value;
 }
 

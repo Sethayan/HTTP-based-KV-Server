@@ -23,7 +23,7 @@ string cache_get(const string &key) {
 
     // Move this key to the front (most recently used)
     cache.order.splice(cache.order.begin(), cache.order, it->second.second);
-    printf("Value return from cache\n");
+    //printf("Value return from cache\n");
     return it->second.first;
 }
 
