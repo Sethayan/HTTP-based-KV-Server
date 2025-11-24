@@ -32,9 +32,7 @@ bool MySQLPool::create_pool() {
             return false;
         }
 
-        // ---------------------------------------------------------
-        // ENABLE AUTO-RECONNECT (MySQL8 compatible)
-        // ---------------------------------------------------------
+        
         bool reconnect = true;
         if (mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect)) {
             last_err_ = "mysql_options MYSQL_OPT_RECONNECT failed";
@@ -42,9 +40,7 @@ bool MySQLPool::create_pool() {
             return false;
         }
 
-        // ---------------------------------------------------------
-        // CONNECT
-        // ---------------------------------------------------------
+    
         if (!mysql_real_connect(conn,
                                 host_.c_str(),
                                 user_.c_str(),
@@ -59,9 +55,7 @@ bool MySQLPool::create_pool() {
             return false;
         }
 
-        // ---------------------------------------------------------
-        // UTF8 encoding
-        // ---------------------------------------------------------
+
         mysql_set_character_set(conn, "utf8mb4");
 
         conns_.push_back(conn);

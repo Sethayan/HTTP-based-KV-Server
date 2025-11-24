@@ -8,14 +8,12 @@
 #include <string>
 #include <cstring>
 
-// ---------------------------
-// GLOBAL OBJECTS
-// ---------------------------
+
 ShardedLRUCache cache(32, 256);
 MySQLPool *dbpool = nullptr;
 AsyncWriter *asyncWriter = nullptr;
 
-// Escape helper
+
 static std::string sql_escape(MYSQL *conn, const std::string &s) {
     std::string out;
     out.resize(s.size() * 2 + 1);
@@ -25,14 +23,12 @@ static std::string sql_escape(MYSQL *conn, const std::string &s) {
     return out;
 }
 
-// ========================================================
-//                   HANDLER CLASS
-// ========================================================
+
 class KVHandler : public CivetHandler {
 
 public:
 
-// ---------------------- GET ----------------------------
+// get
 bool handleGet(CivetServer *, mg_connection *conn) override {
 
     const mg_request_info *ri = mg_get_request_info(conn);
@@ -52,7 +48,7 @@ bool handleGet(CivetServer *, mg_connection *conn) override {
         return true;
     }
 
-    // 1. Try cache
+    
     std::string value;
     if (cache.cache_get(key, value)) {
         mg_printf(conn,
@@ -61,7 +57,7 @@ bool handleGet(CivetServer *, mg_connection *conn) override {
         return true;
     }
 
-    // 2. DB read
+    
     MYSQL *c = dbpool->acquire();
 
     std::string ek = sql_escape(c, key);
@@ -109,7 +105,7 @@ bool handleGet(CivetServer *, mg_connection *conn) override {
 
 
 
-// ---------------------- CREATE (POST) --------------------
+// Create
 bool handlePost(CivetServer *, mg_connection *conn) override {
 
     const mg_request_info *ri = mg_get_request_info(conn);
@@ -151,7 +147,7 @@ bool handlePost(CivetServer *, mg_connection *conn) override {
 
 
 
-// ---------------------- DELETE ---------------------------
+// Delete
 bool handleDelete(CivetServer *, mg_connection *conn) override {
 
     const mg_request_info *ri = mg_get_request_info(conn);
@@ -182,13 +178,11 @@ bool handleDelete(CivetServer *, mg_connection *conn) override {
     return true;
 }
 
-}; // END OF CLASS
+}; 
 
 
 
-// ========================================================
-//                         MAIN
-// ========================================================
+
 int main() {
 
     try {

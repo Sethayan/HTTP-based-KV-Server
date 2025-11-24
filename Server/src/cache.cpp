@@ -15,9 +15,7 @@ size_t ShardedLRUCache::shard_index(const std::string &key) const {
     return std::hash<std::string>{}(key) % num_shards_;
 }
 
-// ======================================================
-// cache_get
-// ======================================================
+
 bool ShardedLRUCache::cache_get(const std::string &key, std::string &value) {
     size_t s = shard_index(key);
     Shard *sh = shards_[s].get();
@@ -36,9 +34,7 @@ bool ShardedLRUCache::cache_get(const std::string &key, std::string &value) {
     return true;
 }
 
-// ======================================================
-// cache_put
-// ======================================================
+
 void ShardedLRUCache::cache_put(const std::string &key, const std::string &value) {
     size_t s = shard_index(key);
     Shard *sh = shards_[s].get();
@@ -65,9 +61,7 @@ void ShardedLRUCache::cache_put(const std::string &key, const std::string &value
     sh->map.emplace(key, std::make_pair(value, sh->lru_list.begin()));
 }
 
-// ======================================================
-// cache_delete
-// ======================================================
+
 void ShardedLRUCache::cache_delete(const std::string &key) {
     size_t s = shard_index(key);
     Shard *sh = shards_[s].get();
@@ -80,9 +74,7 @@ void ShardedLRUCache::cache_delete(const std::string &key) {
     sh->map.erase(it);
 }
 
-// ======================================================
-// cache_display (debugging only)
-// ======================================================
+
 void ShardedLRUCache::cache_display() {
     for (size_t s = 0; s < num_shards_; s++) {
         Shard *sh = shards_[s].get();
@@ -95,9 +87,7 @@ void ShardedLRUCache::cache_display() {
     }
 }
 
-// ======================================================
-// cache_size
-// ======================================================
+
 size_t ShardedLRUCache::cache_size() {
     size_t total = 0;
     for (size_t s = 0; s < num_shards_; s++) {

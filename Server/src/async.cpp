@@ -38,9 +38,7 @@ void AsyncWriter::async_delete(const std::string &key) {
     cv_.notify_one();
 }
 
-// =============================================================
-// worker_loop: runs in background thread
-// =============================================================
+
 void AsyncWriter::worker_loop() {
     while (running_) {
         AsyncTask task;
