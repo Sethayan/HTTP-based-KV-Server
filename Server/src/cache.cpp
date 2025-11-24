@@ -1,67 +1,109 @@
 #include "cache.h"
 #include <iostream>
-#include <unordered_map>
-#include <list>
-#include <string>
+#include <functional>
 
-using namespace std;
-
-// LRUCache class instance
-static LRUCache cache;
-
-void cache_init(int capacity) {
-    cache.capacity = capacity;
-    cache.items.clear();
-    cache.order.clear();
-}
-
-string cache_get(const string &key) {
-    auto it = cache.items.find(key);
-    if (it == cache.items.end()) {
-        return "";  // not found
+ShardedLRUCache::ShardedLRUCache(size_t num_shards, size_t per_shard_capacity)
+    : num_shards_(num_shards), per_shard_capacity_(per_shard_capacity)
+{
+    shards_.reserve(num_shards_);
+    for (size_t i = 0; i < num_shards; i++) {
+        shards_.push_back(std::make_unique<Shard>(per_shard_capacity));
     }
-
-    // Move this key to the front (most recently used)
-    cache.order.splice(cache.order.begin(), cache.order, it->second.second);
-    //printf("Value return from cache\n");
-    return it->second.first;
 }
 
-void cache_put(const string &key, const string &value) {
-    auto it = cache.items.find(key);
+size_t ShardedLRUCache::shard_index(const std::string &key) const {
+    return std::hash<std::string>{}(key) % num_shards_;
+}
 
-    if (it != cache.items.end()) {
-        // Update existing value
-        it->second.first = value;
-        // Move to front (recently used)
-        cache.order.splice(cache.order.begin(), cache.order, it->second.second);
+// ======================================================
+// cache_get
+// ======================================================
+bool ShardedLRUCache::cache_get(const std::string &key, std::string &value) {
+    size_t s = shard_index(key);
+    Shard *sh = shards_[s].get();
+    std::lock_guard<std::mutex> lk(sh->mtx);
+
+    auto it = sh->map.find(key);
+    if (it == sh->map.end())
+        return false;
+
+    // Move key to front (most recently used)
+    sh->lru_list.erase(it->second.second);
+    sh->lru_list.push_front(key);
+    it->second.second = sh->lru_list.begin();
+
+    value = it->second.first;
+    return true;
+}
+
+// ======================================================
+// cache_put
+// ======================================================
+void ShardedLRUCache::cache_put(const std::string &key, const std::string &value) {
+    size_t s = shard_index(key);
+    Shard *sh = shards_[s].get();
+    std::lock_guard<std::mutex> lk(sh->mtx);
+
+    auto it = sh->map.find(key);
+    if (it != sh->map.end()) {
+        // update existing
+        sh->lru_list.erase(it->second.second);
+        sh->lru_list.push_front(key);
+        it->second = {value, sh->lru_list.begin()};
         return;
     }
 
-    // If full, remove least recently used
-    if (cache.items.size() >= cache.capacity) {
-        string lru_key = cache.order.back();
-        cache.order.pop_back();
-        cache.items.erase(lru_key);
+    // evict if full
+    if (sh->map.size() >= sh->capacity) {
+        std::string old = sh->lru_list.back();
+        sh->lru_list.pop_back();
+        sh->map.erase(old);
     }
 
-    // Insert new key
-    cache.order.push_front(key);
-    cache.items[key] = {value, cache.order.begin()};
+    // insert
+    sh->lru_list.push_front(key);
+    sh->map.emplace(key, std::make_pair(value, sh->lru_list.begin()));
 }
 
-void cache_delete(const string &key) {
-    auto it = cache.items.find(key);
-    if (it != cache.items.end()) {
-        cache.order.erase(it->second.second);
-        cache.items.erase(it);
+// ======================================================
+// cache_delete
+// ======================================================
+void ShardedLRUCache::cache_delete(const std::string &key) {
+    size_t s = shard_index(key);
+    Shard *sh = shards_[s].get();
+    std::lock_guard<std::mutex> lk(sh->mtx);
+
+    auto it = sh->map.find(key);
+    if (it == sh->map.end()) return;
+
+    sh->lru_list.erase(it->second.second);
+    sh->map.erase(it);
+}
+
+// ======================================================
+// cache_display (debugging only)
+// ======================================================
+void ShardedLRUCache::cache_display() {
+    for (size_t s = 0; s < num_shards_; s++) {
+        Shard *sh = shards_[s].get();
+        std::lock_guard<std::mutex> lk(sh->mtx);
+
+        std::cout << "Shard " << s << " (" << sh->map.size() << " items): ";
+        for (auto &k : sh->lru_list)
+            std::cout << k << "  ";
+        std::cout << "\n";
     }
 }
 
-void cache_display() {
-    cout << "Cache (MRU → LRU): ";
-    for (const auto &k : cache.order) {
-        cout << "(" << k << " → " << cache.items[k].first << ") ";
+// ======================================================
+// cache_size
+// ======================================================
+size_t ShardedLRUCache::cache_size() {
+    size_t total = 0;
+    for (size_t s = 0; s < num_shards_; s++) {
+        Shard *sh = shards_[s].get();
+        std::lock_guard<std::mutex> lk(sh->mtx);
+        total += sh->map.size();
     }
-    cout << endl;
+    return total;
 }

@@ -1,124 +1,233 @@
-#include "httplib.h"
-#include "db.h"
+#include "CivetServer.h"
 #include "cache.h"
+#include "dbpool.h"
+#include "async.h"
+
 #include <iostream>
-#include <csignal>
-#include <mutex>
-#include <memory>
+#include <sstream>
+#include <string>
+#include <cstring>
 
-using namespace std;
-using namespace httplib;
+// ---------------------------
+// GLOBAL OBJECTS
+// ---------------------------
+ShardedLRUCache cache(32, 256);
+MySQLPool *dbpool = nullptr;
+AsyncWriter *asyncWriter = nullptr;
 
-// PostgreSQL connection info
-static const string DB_CONNINFO =
-    "user=ayan password=Ayan@2003 dbname=kvstore host=127.0.0.1 port=5432";
-
-// Global DB connection + mutex
-static PGconn* conn = nullptr;
-static mutex db_mutex;
-
-// Handle Ctrl+C (SIGINT)
-void handle_sigint(int) {
-    cout << "\n Server shutting down..." << endl;
-    db_close(conn);
-    exit(0);
+// Escape helper
+static std::string sql_escape(MYSQL *conn, const std::string &s) {
+    std::string out;
+    out.resize(s.size() * 2 + 1);
+    unsigned long n = mysql_real_escape_string(conn, &out[0],
+                                               s.c_str(), s.size());
+    out.resize(n);
+    return out;
 }
 
+// ========================================================
+//                   HANDLER CLASS
+// ========================================================
+class KVHandler : public CivetHandler {
+
+public:
+
+// ---------------------- GET ----------------------------
+bool handleGet(CivetServer *, mg_connection *conn) override {
+
+    const mg_request_info *ri = mg_get_request_info(conn);
+
+    char keybuf[512] = {0};
+    if (ri->query_string) {
+        mg_get_var(ri->query_string, strlen(ri->query_string),
+                   "key", keybuf, sizeof(keybuf));
+    }
+
+    std::string key = keybuf;
+
+    if (key.empty()) {
+        mg_printf(conn,
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/plain\r\n\r\nmissing key\n");
+        return true;
+    }
+
+    // 1. Try cache
+    std::string value;
+    if (cache.cache_get(key, value)) {
+        mg_printf(conn,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s",
+            value.c_str());
+        return true;
+    }
+
+    // 2. DB read
+    MYSQL *c = dbpool->acquire();
+
+    std::string ek = sql_escape(c, key);
+    std::string q = "SELECT v FROM kvstore WHERE k='" + ek + "'";
+
+    if (mysql_query(c, q.c_str())) {
+        std::string err = mysql_error(c);
+        dbpool->release(c);
+
+        mg_printf(conn,
+            "HTTP/1.1 500 Internal Server Error\r\n"
+            "Content-Type: text/plain\r\n\r\nDB error: %s\n", err.c_str());
+        return true;
+    }
+
+    MYSQL_RES *res = mysql_store_result(c);
+    bool found = false;
+
+    if (res) {
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (row) {
+            value = row[0] ? row[0] : "";
+            found = true;
+        }
+        mysql_free_result(res);
+    }
+
+    dbpool->release(c);
+
+    if (!found) {
+        mg_printf(conn,
+            "HTTP/1.1 404 Not Found\r\n"
+            "Content-Type: text/plain\r\n\r\nnot found\n");
+        return true;
+    }
+
+    // store to cache
+    cache.cache_put(key, value);
+
+    mg_printf(conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%s",
+        value.c_str());
+    return true;
+}
+
+
+
+// ---------------------- CREATE (POST) --------------------
+bool handlePost(CivetServer *, mg_connection *conn) override {
+
+    const mg_request_info *ri = mg_get_request_info(conn);
+
+    long long len = ri->content_length;
+    std::string body;
+
+    if (len > 0) {
+        body.resize(len);
+        mg_read(conn, &body[0], len);
+    }
+
+    char kbuf[512] = {0};
+    char vbuf[4096] = {0};
+
+    mg_get_var(body.c_str(), body.size(), "key", kbuf, sizeof(kbuf));
+    mg_get_var(body.c_str(), body.size(), "value", vbuf, sizeof(vbuf));
+
+    std::string key = kbuf;
+    std::string value = vbuf;
+
+    if (key.empty()) {
+        mg_printf(conn,
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/plain\r\n\r\nmissing key\n");
+        return true;
+    }
+
+    // Update cache
+    cache.cache_put(key, value);
+
+    // Async DB insert/update
+    asyncWriter->async_insert(key, value);
+
+    mg_printf(conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok\n");
+    return true;
+}
+
+
+
+// ---------------------- DELETE ---------------------------
+bool handleDelete(CivetServer *, mg_connection *conn) override {
+
+    const mg_request_info *ri = mg_get_request_info(conn);
+
+    char keybuf[512] = {0};
+    if (ri->query_string) {
+        mg_get_var(ri->query_string, strlen(ri->query_string),
+                   "key", keybuf, sizeof(keybuf));
+    }
+
+    std::string key = keybuf;
+
+    if (key.empty()) {
+        mg_printf(conn,
+            "HTTP/1.1 400 Bad Request\r\n"
+            "Content-Type: text/plain\r\n\r\nmissing key\n");
+        return true;
+    }
+
+    // remove from cache
+    cache.cache_delete(key);
+
+    // async delete from db
+    asyncWriter->async_delete(key);
+
+    mg_printf(conn,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\ndeleted\n");
+    return true;
+}
+
+}; // END OF CLASS
+
+
+
+// ========================================================
+//                         MAIN
+// ========================================================
 int main() {
-    signal(SIGINT, handle_sigint);
 
-    // Initialize cache with capacity 5
-    cache_init(5);
+    try {
+        dbpool = new MySQLPool(
+            "127.0.0.1",
+            "root",
+            "Ayan@2003",
+            "kvdb",
+            3306,
+            8
+        );
 
-    // Connect to PostgreSQL
-    conn = db_connect(DB_CONNINFO);
-    if (!conn) {
-        cerr << " Failed to connect to PostgreSQL" << endl;
+        asyncWriter = new AsyncWriter(dbpool);
+        asyncWriter->start();
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Fatal: " << e.what() << std::endl;
         return 1;
     }
 
-    Server svr;
+    const char *opts[] = {
+        "listening_ports", "8080",
+        nullptr
+    };
 
-    // ---------------- CREATE ----------------
-    svr.Post("/create", [](const Request &req, Response &res) {
-        //cout <<"Debug created"<<endl;
-        //cache_display();
-        string key = req.get_param_value("key");
-        string value = req.get_param_value("value");
+    CivetServer server(opts);
 
-        if (key.empty() || value.empty()) {
-            res.status = 400;
-            res.set_content("Missing key or value", "text/plain");
-            return;
-        }
+    KVHandler handler;
 
-        lock_guard<mutex> lock(db_mutex);
-        if (db_create(conn, key, value)) {
-            cache_put(key, value);
-            res.set_content(" Created successfully\n", "text/plain");
-        } else {
-            res.status = 500;
-            res.set_content("DB insert error\n", "text/plain");
-        }
-    });
+    server.addHandler("/create", handler);
+    server.addHandler("/get", handler);
+    server.addHandler("/delete", handler);
 
-    // ---------------- READ ----------------
-    svr.Get("/read", [](const Request &req, Response &res) {
-        //cout <<"Debug read"<<endl;
-        //cache_display();
-        string key = req.get_param_value("key");
+    std::cout << "KV Server running on port 8080\n";
+    getchar();
 
-        if (key.empty()) {
-            res.status = 400;
-            res.set_content("Missing key\n", "text/plain");
-            return;
-        }
+    asyncWriter->stop();
+    delete asyncWriter;
+    delete dbpool;
 
-        // Try cache first
-        string cached = cache_get(key);
-        if (!cached.empty()) {
-            res.set_content(cached + "\n", "text/plain");
-            return;
-        }
-        
-
-        // If not in cache, fetch from DB
-        lock_guard<mutex> lock(db_mutex);
-        string value = db_read(conn, key);
-        if (!value.empty()) {
-            cache_put(key, value);
-            res.set_content(value + "\n", "text/plain");
-        } else {
-            res.status = 404;
-            res.set_content("Key not found\n", "text/plain");
-        }
-    });
-
-    // ---------------- DELETE ----------------
-    svr.Delete("/delete", [](const Request &req, Response &res) {
-        //cout <<"Debug delete"<<endl;
-        //cache_display();
-        string key = req.get_param_value("key");
-
-        if (key.empty()) {
-            res.status = 400;
-            res.set_content("Missing key\n", "text/plain");
-            return;
-        }
-
-        lock_guard<mutex> lock(db_mutex);
-        if (db_delete(conn, key)) {
-            cache_delete(key);
-            res.set_content(" Deleted successfully\n", "text/plain");
-        } else {
-            res.status = 500;
-            res.set_content("DB delete failed\n", "text/plain");
-        }
-    });
-
-    cout << "🚀 Server running at http://localhost:8080" << endl;
-    svr.listen("0.0.0.0", 8080);
-
-    db_close(conn);
     return 0;
 }

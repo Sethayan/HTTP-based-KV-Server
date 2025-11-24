@@ -1,34 +1,42 @@
-# Compiler and flags
-CXX = g++
-CXXFLAGS = -Wall -O2
+# ===============================
+# Load Generator Makefile
+# ===============================
 
-# Libraries to link
-LIBS = -lpthread -lcurl
+CXX      := g++
+CXXFLAGS := -std=c++17 -O2 -Wall
+LDFLAGS  := -lcurl -lpthread
 
-# Target executable
-TARGET = loadgen
+TARGET   := loadgen
+SRC      := loadgen.cpp
 
-# Source files
-SRCS = loadgen.cpp
+# ===============================
+# Build Rules
+# ===============================
 
-# Object files
-OBJS = $(SRCS:.cpp=.o)
-
-# Default rule
 all: $(TARGET)
 
-# Build binary
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJS) $(LIBS)
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) $(SRC) $(LDFLAGS) -o $(TARGET)
+	@echo "✔ Build complete → $(TARGET)"
 
-# Compile source to object
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# ===============================
+# Run (taskset -c 2-5)
+# run with: make run T=4 D=20 M=get-put
+# ===============================
 
-# Run program
 run: $(TARGET)
-	./$(TARGET)
+	@if [ -z "$(T)" ] || [ -z "$(D)" ] || [ -z "$(M)" ]; then \
+		echo "Usage: make run T=<threads> D=<duration> M=<mode>"; \
+		exit 1; \
+	fi
+	taskset -c 2-5 ./$(TARGET) $(T) $(D) $(M)
 
-# Clean build files
+# ===============================
+# Clean
+# ===============================
+
 clean:
-	rm -f $(TARGET) $(OBJS)
+	rm -f $(TARGET)
+	@echo "✔ Cleaned"
+
+.PHONY: all clean run

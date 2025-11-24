@@ -1,264 +1,241 @@
-// loadgen.cpp
-// Compile: g++ -std=c++17 loadgen.cpp -lcurl -lpthread -O2 -o loadgen
+// loadgen.cpp — rewritten for your KV server on port 8080
+// Supports workloads: get-popular, get-all, put-all, get-put
+// Endpoints:
+//   POST   /create   (key=value form)
+//   GET    /get?key=
+//   DELETE /delete?key=
 
 #include <iostream>
-#include <thread>
-#include <vector>
-#include <atomic>
-#include <chrono>
-#include <random>
 #include <string>
-#include <cstring>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <random>
+#include <mutex>
 #include <curl/curl.h>
 
-using namespace std;
-using namespace std::chrono;
+std::atomic<long long> total_requests(0);
+std::atomic<long long> total_response_time_us(0);
+std::atomic<long long> total_failed(0);
+std::atomic<bool> stop_test(false);
 
-// ---------- Globals / Stats ----------
-atomic<long long> total_latency_us(0); // accumulated latency in microseconds
-atomic<long long> successful_requests(0);
-atomic<long long> failed_requests(0);
-atomic<bool> stop_flag(false);
+const std::string BASE_URL = "http://127.0.0.1:8080";
 
-// ---------- Config / Workload ----------
-enum class Workload { PUT_ALL, GET_ALL, GET_POPULAR, MIXED };
+std::mutex pop_mtx;
+std::vector<std::string> popular_keys;
+const int POPULAR_KEY_COUNT = 50;
 
-struct Config {
-    string host = "127.0.0.1";
-    int port = 8080;
-    int threads = 4;
-    int duration = 30; // seconds
-    Workload workload = Workload::MIXED;
-    int popular_count = 10; // for GET_POPULAR
-    int key_space_per_thread = 100; // used for unique keys
-};
-
-// write callback that discards response body
-static size_t discard_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
-    (void)ptr; (void)userdata;
+static size_t write_callback(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    (void)ptr;
+    (void)userdata;
     return size * nmemb;
 }
 
-// build URL string helper
-static string url_base(const Config &cfg) {
-    return string("http://") + cfg.host + ":" + to_string(cfg.port);
+// -----------------------------------------------------
+// Request helpers
+// -----------------------------------------------------
+
+bool do_get(CURL *curl, const std::string &url) {
+    curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+
+    long code = 0;
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+    return (rc == CURLE_OK && code == 200);
 }
 
-// preload popular keys (synchronous, single-threaded)
-void preload_popular(const Config &cfg) {
-    string base = url_base(cfg);
+bool do_delete(CURL *curl, const std::string &url) {
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+
+    long code = 0;
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, NULL);
+    return (rc == CURLE_OK && code == 200);
+}
+
+bool do_post(CURL *curl, const std::string &key, const std::string &val) {
+    std::string body = "key=" + key + "&value=" + val;
+
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
+
+    curl_easy_setopt(curl, CURLOPT_URL, (BASE_URL + "/create").c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    long code = 0;
+    CURLcode rc = curl_easy_perform(curl);
+
+    if (rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+    curl_easy_setopt(curl, CURLOPT_POST, 0L);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, NULL);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, NULL);
+
+    curl_slist_free_all(headers);
+
+    return (rc == CURLE_OK && code == 200);
+}
+
+// -----------------------------------------------------
+// Worker thread
+// -----------------------------------------------------
+
+void worker(const std::string &workload) {
     CURL *curl = curl_easy_init();
     if (!curl) return;
 
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
 
-    for (int i = 0; i < cfg.popular_count; ++i) {
-        string post_data = "key=popular_" + to_string(i) + "&value=popular_val_" + to_string(i);
-        string url = base + "/create";
+    std::mt19937 rng(std::random_device{}());
+    std::uniform_int_distribution<> psel(0, POPULAR_KEY_COUNT - 1);
+    std::uniform_int_distribution<> mode(0, 99);
 
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-        curl_easy_setopt(curl, CURLOPT_POST, 1L);
-        curl_easy_perform(curl);
-    }
+    while (!stop_test.load()) {
+        auto t1 = std::chrono::steady_clock::now();
+        bool ok = false;
 
-    curl_easy_cleanup(curl);
-}
+        if (workload == "put-all") {
+            std::string key = "k" + std::to_string(rng() % 1000000);
+            std::string val = "v" + std::to_string(rng());
+            ok = do_post(curl, key, val);
 
+        } else if (workload == "get-all") {
+            std::string key = "k" + std::to_string(rng() % 1000000);
+            ok = do_get(curl, BASE_URL + "/get?key=" + key);
 
-// thread-local random helpers
-inline int randint(mt19937 &rng, int lo, int hi) {
-    return uniform_int_distribution<int>(lo, hi)(rng);
-}
+        } else if (workload == "get-popular") {
+            std::string key;
+            {
+                std::lock_guard<std::mutex> lk(pop_mtx);
+                key = popular_keys[psel(rng)];
+            }
+            ok = do_get(curl, BASE_URL + "/get?key=" + key);
 
-// create/read/delete request generator per workload
-void client_thread(int id, const Config &cfg) {
-    string base = url_base(cfg);
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        cerr << "Thread " << id << ": curl init failed\n";
-        return;
-    }
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_write_cb);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000L);
+        } else if (workload == "get-put") {
 
-    // RNG per thread
-    random_device rd;
-    mt19937 rng(rd() ^ (id << 16));
+            int r = mode(rng);
 
-    long long local_counter = 0;
-        while (!stop_flag.load(memory_order_relaxed)) {
-        string url;
-        const char *custom_method = nullptr;
-        string post_data;
+            if (r < 70) {
+                // GET popular
+                std::string key;
+                {
+                    std::lock_guard<std::mutex> lk(pop_mtx);
+                    key = popular_keys[psel(rng)];
+                }
+                ok = do_get(curl, BASE_URL + "/get?key=" + key);
 
-        if (cfg.workload == Workload::PUT_ALL) {
-            // POST with body data instead of query
-            url = base + "/create";
-            post_data = "key=put_t" + to_string(id) + "_" + to_string(local_counter) +
-                        "&value=" + to_string(randint(rng, 0, 1000000));
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-            curl_easy_setopt(curl, CURLOPT_POST, 1L);
-            custom_method = nullptr;
-        }
-        else if (cfg.workload == Workload::GET_ALL) {
-            url = base + "/read?key=getall_t" + to_string(id) + "_" + to_string(local_counter);
-            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-            custom_method = nullptr;
-        }
-        else if (cfg.workload == Workload::GET_POPULAR) {
-            int k = randint(rng, 0, max(1, cfg.popular_count) - 1);
-            url = base + "/read?key=popular_" + to_string(k);
-            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-            custom_method = nullptr;
-        }
-        else { // MIXED workload
-            int op = randint(rng, 0, 99);
-            if (op < 40) { // 40% read popular
-                int k = randint(rng, 0, max(1, cfg.popular_count) - 1);
-                url = base + "/read?key=popular_" + to_string(k);
-                curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-                custom_method = nullptr;
-            } else if (op < 75) { // 35% create
-                url = base + "/create";
-                post_data = "key=mixed_t" + to_string(id) + "_" + to_string(local_counter) +
-                            "&value=" + to_string(randint(rng, 0, 1000000));
-                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-                curl_easy_setopt(curl, CURLOPT_POST, 1L);
-                custom_method = nullptr;
-            } else { // 25% delete
-                int k = randint(rng, 0, cfg.key_space_per_thread - 1);
-                url = base + "/delete?key=mixed_t" + to_string(id) + "_" + to_string(k);
-                curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
-                custom_method = "DELETE";
+            } else if (r < 90) {
+                // random PUT
+                std::string key = "k" + std::to_string(rng() % 1000000);
+                std::string val = "v" + std::to_string(rng());
+                ok = do_post(curl, key, val);
+
+            } else {
+                // random DELETE
+                std::string key = "k" + std::to_string(rng() % 1000000);
+                ok = do_delete(curl, BASE_URL + "/delete?key=" + key);
             }
         }
 
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-
-        // ensure we don't accidentally keep previous POST flag if not using POST
-        if (cfg.workload != Workload::PUT_ALL && !(cfg.workload == Workload::MIXED && custom_method == nullptr && url.find("/create?") != string::npos)) {
-            // best effort clear: set to HTTPGET (curl will override for POST/CUSTOM)
-            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-        }
-
-        auto t0 = high_resolution_clock::now();
-        CURLcode cres = curl_easy_perform(curl);
-        auto t1 = high_resolution_clock::now();
-
-        long http_code = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        // cout << http_code << endl;
-
-        long long latency_us = duration_cast<microseconds>(t1 - t0).count();
-
-        bool ok = (cres == CURLE_OK);
         if (ok) {
-          if (http_code >= 200 && http_code < 300) {
-             ok = true;
-          } else if ((cfg.workload == Workload::GET_ALL || cfg.workload == Workload::GET_POPULAR) && http_code == 404) {
-          // Not found is acceptable for read workloads
-          ok = true;
-          } else if (cfg.workload == Workload::MIXED && http_code == 404) {
-         // Also fine in mixed workload, since some deletes/read may hit missing keys
-          ok = true;
-          } else {
-          ok = false;
+            auto t2 = std::chrono::steady_clock::now();
+            long long us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+            total_requests++;
+            total_response_time_us += us;
+        } else {
+            total_failed++;
         }
-    }
-
-    if (ok) {
-      successful_requests.fetch_add(1, memory_order_relaxed);
-      total_latency_us.fetch_add(latency_us, memory_order_relaxed);
-    } else {
-       failed_requests.fetch_add(1, memory_order_relaxed);
-    }
-
-
-        // reset POST/CUSTOM flags so next iteration is clean
-        curl_easy_setopt(curl, CURLOPT_POST, 0L);
-        if (custom_method) curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, nullptr);
-
-        local_counter++;
     }
 
     curl_easy_cleanup(curl);
 }
 
-// ---------- Main ----------
-int main(int argc, char* argv[]) {
-    if (argc < 6) {
-        cerr << "Usage: " << argv[0] << " <server_host> <port> <num_threads> <duration_sec> <workload> [popular_count]\n";
-        cerr << "workload: put_all | get_all | get_popular | mixed\n";
-        cerr << "Example: ./loadgen 127.0.0.1 8080 8 30 mixed 10\n";
+// -----------------------------------------------------
+// Pre-populate popular keys (for get-popular, get-put)
+// -----------------------------------------------------
+
+void prepopulate() {
+    CURL *curl = curl_easy_init();
+    if (!curl) return;
+
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+
+    std::mt19937 rng(std::random_device{}());
+
+    for (int i = 0; i < POPULAR_KEY_COUNT; i++) {
+        std::string key = "popular_" + std::to_string(i);
+        std::string val = "val_" + std::to_string(rng());
+
+        if (do_post(curl, key, val)) {
+            popular_keys.push_back(key);
+        }
+    }
+
+    curl_easy_cleanup(curl);
+
+    if (popular_keys.empty()) {
+        std::cerr << "ERROR: Prepopulate failed. Server not responding?\n";
+        exit(1);
+    }
+}
+
+// -----------------------------------------------------
+// Main
+// -----------------------------------------------------
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        std::cout << "Usage: ./loadgen <threads> <duration> <workload>\n";
+        std::cout << "Workloads: get-popular | get-all | put-all | get-put\n";
         return 1;
     }
 
-    Config cfg;
-    cfg.host = argv[1];
-    cfg.port = atoi(argv[2]);
-    cfg.threads = atoi(argv[3]);
-    cfg.duration = atoi(argv[4]);
-    string wl = argv[5];
-    if (wl == "put_all") cfg.workload = Workload::PUT_ALL;
-    else if (wl == "get_all") cfg.workload = Workload::GET_ALL;
-    else if (wl == "get_popular") cfg.workload = Workload::GET_POPULAR;
-    else if (wl == "mixed") cfg.workload = Workload::MIXED;
-    else {
-        cerr << "Unknown workload: " << wl << "\n";
-        return 1;
-    }
-    if (argc >= 7) cfg.popular_count = atoi(argv[6]);
+    int threads = std::stoi(argv[1]);
+    int duration = std::stoi(argv[2]);
+    std::string workload = argv[3];
 
-    // initialize curl globally
-    CURLcode g = curl_global_init(CURL_GLOBAL_ALL);
-    if (g != CURLE_OK) {
-        cerr << "curl_global_init failed\n";
-        return 1;
+    curl_global_init(CURL_GLOBAL_ALL);
+
+    if (workload == "get-popular" || workload == "get-put") {
+        prepopulate();
     }
 
-    // preload popular keys if needed
-    if (cfg.workload == Workload::GET_POPULAR || cfg.workload == Workload::MIXED) {
-        cout << "[info] Preloading " << cfg.popular_count << " popular keys...\n";
-        preload_popular(cfg);
-    }
+    std::vector<std::thread> pool;
+    for (int i = 0; i < threads; i++)
+        pool.emplace_back(worker, workload);
 
-    cout << "[info] Starting closed-loop load test\n";
-    cout << " host=" << cfg.host << " port=" << cfg.port
-         << " threads=" << cfg.threads << " duration=" << cfg.duration
-         << " workload=" << wl << " popular_count=" << cfg.popular_count << "\n";
+    std::this_thread::sleep_for(std::chrono::seconds(duration));
+    stop_test = true;
 
-    // launch threads
-    vector<thread> threads;
-    threads.reserve(cfg.threads);
-    for (int i = 0; i < cfg.threads; ++i) {
-        threads.emplace_back(client_thread, i, cfg);
-    }
+    for (auto &t : pool) t.join();
 
-    // sleep for test duration
-    this_thread::sleep_for(seconds(cfg.duration));
-    stop_flag.store(true, memory_order_relaxed);
+    long long ok = total_requests.load();
+    long long failed = total_failed.load();
 
-    // join threads
-    for (auto &t : threads) t.join();
+    double tps = ok / (double)duration;
+    double avg_us = ok ? (double)total_response_time_us.load() / ok : 0;
 
-    // compute results
-    long long succ = successful_requests.load();
-    long long fail = failed_requests.load();
-    double duration_s = (double)cfg.duration;
-    double throughput = (duration_s > 0) ? (double)succ / duration_s : 0.0;
-    double avg_resp_ms = (succ > 0) ? ((double)total_latency_us.load() / 1000.0 / (double)succ) : 0.0;
-
-    cout << "\n=== Load Test Results ===\n";
-    cout << "Duration (s):        " << duration_s << "\n";
-    cout << "Successful requests: " << succ << "\n";
-    cout << "Failed requests:     " << fail << "\n";
-    cout << "Throughput (req/s):  " << throughput << "\n";
-    cout << "Avg response time:   " << avg_resp_ms << " ms\n";
-    cout << "========================\n";
+    std::cout << "\n=== RESULTS ===\n";
+    std::cout << "Threads:      " << threads << "\n";
+    std::cout << "Duration:     " << duration << " sec\n";
+    std::cout << "Success:      " << ok << "\n";
+    std::cout << "Failed:       " << failed << "\n";
+    std::cout << "Throughput:   " << tps << " req/s\n";
+    std::cout << "Avg Latency:  " << avg_us << " us\n";
+    std::cout << "================\n";
 
     curl_global_cleanup();
     return 0;
